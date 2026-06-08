@@ -16,7 +16,7 @@ source venv/bin/activate
 # DDP launch: torchrun spawns one process per GPU. The training script reads
 # RANK / LOCAL_RANK / WORLD_SIZE from torchrun's env. gradient_accumulation_steps
 # is divided by world_size internally, so keep it divisible by 2.
-torchrun --standalone --nproc_per_node=2 train_gpt_adam_forward_ckpts.py \
+torchrun --standalone --nproc_per_node=2 language/train_gpt_adam_forward_ckpts.py \
     --dataset_name openwebtext \
     --num_layers 12 \
     --num_heads 12 \

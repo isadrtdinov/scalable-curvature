@@ -5,6 +5,7 @@ checkpoints
 output/
 configs/beaker_configs/auto_created
 runs/
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

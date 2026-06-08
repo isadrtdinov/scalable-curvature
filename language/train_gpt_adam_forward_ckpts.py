@@ -421,7 +421,7 @@ def train_and_evaluate(cfg, device):
             # eigenvalue estimation using lobpcg method
             pre_sharpness_step, pre_eigvec, num_iters_pre_sharpness = (
                 sharpness_utils.get_pre_sharpness_lobpcg(
-                    model,
+                    raw_model,
                     loss_fn,
                     optim,
                     (X[:16], Y[:16]),
@@ -436,7 +436,7 @@ def train_and_evaluate(cfg, device):
             # eigenvalue estimation using lobpcg method
             sharpness_step, eigvec, num_iters_sharpness = (
                 sharpness_utils.get_sharpness_lobpcg(
-                    model,
+                    raw_model,
                     loss_fn,
                     (X[:16], Y[:16]),
                     eigvecs=eigvec,

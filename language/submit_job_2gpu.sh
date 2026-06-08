@@ -21,8 +21,8 @@ torchrun --standalone --nproc_per_node=2 train_gpt_adam_forward_ckpts.py \
     --num_layers 12 \
     --num_heads 12 \
     --init_var 1.0 \
-    --batch_size 64 \
-    --gradient_accumulation_steps 8 \
+    --batch_size 16 \
+    --gradient_accumulation_steps 32 \
     --lr_peak 1e-05 \
     --lr_min_factor inf \
     --grad_clip 0.0 \
@@ -35,4 +35,5 @@ torchrun --standalone --nproc_per_node=2 train_gpt_adam_forward_ckpts.py \
     --sharpness_interval 10 \
     --ckpt_interval 500 \
     --use_wandb true \
-    --wandb_project scalable-curvature
+    --wandb_project scalable-curvature \
+    --wandb_run_name gpt2-curvature

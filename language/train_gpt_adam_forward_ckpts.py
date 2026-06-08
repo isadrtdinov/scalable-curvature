@@ -23,6 +23,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import argparse
+import hashlib
 import os
 from contextlib import nullcontext
 
@@ -36,6 +37,20 @@ from utils.data_storage import DataStorage
 from utils.gpt import GPT, GPTConfig
 from utils.loss_functions import CrossEntropyLoss
 from utils.schedules_utils import warmup_stable_decay
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
+
+
+def mprint(*args, **kwargs):
+    """print() only on the master DDP rank; relies on cfg defined at module scope."""
+    if cfg.master_process:
+        print(*args, **kwargs)
 
 torch.backends.cuda.matmul.allow_tf32 = True  # enable tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # enable tf32 on cudnn
@@ -117,25 +132,51 @@ def save_checkpoint(model, optim, step, config, ckpt_dir="./checkpoints"):
         "step": step,
         "config": config,
     }
-    print(f"saving checkpoint to {ckpt_dir}")
+    mprint(f"saving checkpoint to {ckpt_dir}")
     ckpt_name = f"{get_ckpt_filename(config, step)}.ckpt"
     torch.save(checkpoint, os.path.join(ckpt_dir, ckpt_name))
 
     return
 
 
-def get_last_checkpoint(cfg, device):
-    save_steps = [
-        cfg.ckpt_interval * i for i in range(0, cfg.num_steps // cfg.ckpt_interval + 1)
-    ]
+POWERS_OF_TWO_UNDER_1000 = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
 
+
+def get_checkpoint_steps(num_steps, ckpt_interval):
+    """Steps at which a checkpoint is saved, in ascending order.
+
+    Schedule: step 0 and powers of 2 below 1000 (1, 2, 4, ..., 512), then
+    1000, 1000 + ckpt_interval, 1000 + 2*ckpt_interval, ... up to num_steps.
+    """
+    steps = [0]
+    steps.extend(p for p in sorted(POWERS_OF_TWO_UNDER_1000) if p <= num_steps)
+    s = 1000
+    while s <= num_steps:
+        steps.append(s)
+        s += ckpt_interval
+    return steps
+
+
+def is_checkpoint_step(step, ckpt_interval):
+    """Whether `step` is on the checkpoint schedule (see get_checkpoint_steps)."""
+    if step == 0:
+        return True
+    if step < 1000:
+        return step in POWERS_OF_TWO_UNDER_1000
+    return (step - 1000) % ckpt_interval == 0
+
+
+def get_last_checkpoint(cfg, device):
+    save_steps = get_checkpoint_steps(cfg.num_steps, cfg.ckpt_interval)
+
+    ckpt_path = None
     for step in save_steps[::-1]:
         ckpt_name = f"{get_ckpt_filename(cfg, step)}.ckpt"
         ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
         if os.path.exists(ckpt_path):
-            print(f"Checkpoint found at: {ckpt_path}")
+            mprint(f"Checkpoint found at: {ckpt_path}")
             return torch.load(ckpt_path, map_location=device, weights_only=False)
-    print(f"No checkpoint found at {ckpt_path}")
+    mprint(f"No checkpoint found at {ckpt_path}")
     return None
 
 
@@ -181,8 +222,8 @@ def train_and_evaluate(cfg, device):
     model, loss_fn, optim = create_train_state(cfg, device)
 
     num_params, embd_params = model.get_num_params()
-    print("number of parameters: %.2fM" % (num_params / 1e6,))
-    print("number of embd params: %.2fM" % (embd_params / 1e6,))
+    mprint("number of parameters: %.2fM" % (num_params / 1e6,))
+    mprint("number of embd params: %.2fM" % (embd_params / 1e6,))
 
     ### LOAD CHECKPOINT ###
     # Load the last checkpoint if it exists
@@ -246,7 +287,7 @@ def train_and_evaluate(cfg, device):
 
     # load the last checkpoint if (1) it exists and (2) the data exists
     if load_checkpoint and last_ckpt is not None:
-        print(f"Loading from checkpoint at step {init_steps}...")
+        mprint(f"Loading from checkpoint at step {init_steps}...")
         # load model and optimizer state dicts
         state_dict = last_ckpt["model"]
         init_steps = last_ckpt["step"]
@@ -259,7 +300,7 @@ def train_and_evaluate(cfg, device):
         model.load_state_dict(state_dict)
         optim.load_state_dict(last_ckpt["optim"])
     else:
-        print(
+        mprint(
             "Either no checkpoint found or data does not exist, starting from scratch."
         )
         init_steps = 0
@@ -278,7 +319,7 @@ def train_and_evaluate(cfg, device):
 
     # compile the model
     if cfg.compile:
-        print("compiling the model... (takes a ~minute)")
+        mprint("compiling the model... (takes a ~minute)")
         model = torch.compile(model)
 
     # wrap model into DDP container
@@ -311,7 +352,7 @@ def train_and_evaluate(cfg, device):
     )
     ### Data loader ###
     data_dir = os.path.join("data", cfg.dataset_name)
-    print(f"data_dir: {data_dir}")
+    mprint(f"data_dir: {data_dir}")
 
     X, Y = get_batch(data_dir, "train", cfg.context_len, cfg.batch_size, device)
     # initial eigenvec
@@ -319,9 +360,28 @@ def train_and_evaluate(cfg, device):
     pre_eigvec = None
     crit_thresh = (2 + 2 * cfg.beta1) / (1 - cfg.beta1)
 
-    print(f"Recompute Grads: {cfg.recompute_grads}")
+    mprint(f"Recompute Grads: {cfg.recompute_grads}")
+
+    ### WANDB INIT ###
+    use_wandb = cfg.use_wandb and cfg.master_process and WANDB_AVAILABLE
+    if cfg.use_wandb and cfg.master_process and not WANDB_AVAILABLE:
+        mprint("wandb requested but not installed; skipping wandb logging.")
+    if use_wandb:
+        run_base = get_base_filename(cfg, cfg.num_steps)
+        # deterministic id so resuming a run continues the same wandb run
+        run_id = hashlib.md5(run_base.encode()).hexdigest()
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name=cfg.wandb_run_name or run_base[:128],
+            id=run_id,
+            resume="allow",
+            config={**vars(cfg), "num_params": num_params, "embd_params": embd_params},
+        )
 
     for step in range(init_steps, cfg.num_steps + 1):
+
+        wandb_metrics = {} if use_wandb else None
 
         ### SHARPNESS AND CRITICAL LR ESTIMATION ###
 
@@ -331,7 +391,7 @@ def train_and_evaluate(cfg, device):
             model=model,
             loss_fn=loss_fn,
             optim=optim,
-            batch=(X, Y),
+            batch=(X[:16], Y[:16]),
             lr_guess=lr_guess,
             tol_power=cfg.crit_lr_tol_power,
             recompute_grads=cfg.recompute_grads,
@@ -346,9 +406,13 @@ def train_and_evaluate(cfg, device):
             lr_upper=lr_upper,
             num_iters_critical=num_iters_critical,
         )
-        print(
+        mprint(
             f"LR Range: {lr_lower:0.1e}, {lr_upper:0.1e} computed in {num_iters_critical} steps"
         )
+        if use_wandb:
+            wandb_metrics["lr_lower"] = lr_lower
+            wandb_metrics["lr_upper"] = lr_upper
+            wandb_metrics["num_iters_critical"] = num_iters_critical
 
         # flush the gradients before sharpness computation to save memory; only saves memory for sharpness and not pre conditioned sharpness
         optim.zero_grad(set_to_none=True)
@@ -360,13 +424,13 @@ def train_and_evaluate(cfg, device):
                     model,
                     loss_fn,
                     optim,
-                    (X, Y),
+                    (X[:16], Y[:16]),
                     eigvecs=pre_eigvec,
                     tol=cfg.sharpness_tol,
                     max_iters=cfg.max_iters,
                 )
             )
-            print(
+            mprint(
                 f"Pre-sharpness: {pre_sharpness_step:0.4f} computed in {num_iters_pre_sharpness} steps, critical LR: {crit_thresh/pre_sharpness_step:0.1e}"
             )
             # eigenvalue estimation using lobpcg method
@@ -374,13 +438,13 @@ def train_and_evaluate(cfg, device):
                 sharpness_utils.get_sharpness_lobpcg(
                     model,
                     loss_fn,
-                    (X, Y),
+                    (X[:16], Y[:16]),
                     eigvecs=eigvec,
                     tol=cfg.sharpness_tol,
                     max_iters=cfg.max_iters,
                 )
             )
-            print(
+            mprint(
                 f"Sharpness: {sharpness_step:0.4f} computed in {num_iters_sharpness} steps"
             )
 
@@ -393,12 +457,20 @@ def train_and_evaluate(cfg, device):
                 sharpness=sharpness_step,
                 num_iters=num_iters_sharpness,
             )
+            if use_wandb:
+                wandb_metrics["pre_sharpness"] = pre_sharpness_step
+                wandb_metrics["pre_num_iters"] = num_iters_pre_sharpness
+                wandb_metrics["sharpness"] = sharpness_step
+                wandb_metrics["num_iters_sharpness"] = num_iters_sharpness
+                wandb_metrics["critical_lr_sharpness"] = (
+                    crit_thresh / pre_sharpness_step
+                )
 
             # flush the gradients; I dont think I need it here but just to be safe
             optim.zero_grad(set_to_none=True)
 
         ### CHECKPOINTING ###
-        if step % cfg.ckpt_interval == 0 and cfg.master_process:
+        if is_checkpoint_step(step, cfg.ckpt_interval) and cfg.master_process:
             save_checkpoint(
                 model=raw_model,
                 optim=optim,
@@ -425,6 +497,9 @@ def train_and_evaluate(cfg, device):
                 train_loss=losses["train"].item(),
                 val_loss=losses["val"].item(),
             )
+            if use_wandb:
+                wandb_metrics["train_loss"] = losses["train"].item()
+                wandb_metrics["val_loss"] = losses["val"].item()
 
             # save the results at every interval
             train_results.save_to_csv(cfg.train_path)
@@ -482,8 +557,13 @@ def train_and_evaluate(cfg, device):
         ### Loss storage ##
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * cfg.gradient_accumulation_steps
-        print(f"step: {step}, lr: {lr_step:0.1e}, loss: {lossf:.4f}")
+        mprint(f"step: {step}, lr: {lr_step:0.1e}, loss: {lossf:.4f}")
         train_results.add_entry(step=step, lr_step=lr_step, loss_step=lossf)
+
+        if use_wandb:
+            wandb_metrics["lr_step"] = lr_step
+            wandb_metrics["loss_step"] = lossf
+            wandb.log(wandb_metrics, step=step)
 
         ### Optimizer step ###
         optim.step()
@@ -494,6 +574,9 @@ def train_and_evaluate(cfg, device):
     forward_results.save_to_csv(cfg.forward_path)
     eval_results.save_to_csv(cfg.evals_path)
     sharpness_results.save_to_csv(cfg.sharpness_path)
+
+    if use_wandb:
+        wandb.finish()
 
     # destroy the DDP process group
     if cfg.ddp:
@@ -530,7 +613,7 @@ parser.add_argument("--use_flash", type=lambda x: x.lower() == "true", default=F
 # AdamW optimizer
 parser.add_argument("--optim_name", type=str, default="AdamW")
 parser.add_argument("--lr_init", type=float, default=0.0)
-parser.add_argument("--lr_peak", type=float, default=1e-04)
+parser.add_argument("--lr_peak", type=float, default=1e-05)
 parser.add_argument(
     "--lr_min_factor",
     type=lambda x: float("inf") if x.lower() == "inf" else float(x),
@@ -544,13 +627,13 @@ parser.add_argument("--weight_decay", type=float, default=0.0)
 parser.add_argument("--num_steps", type=int, default=10_000)
 parser.add_argument("--warmup_steps", type=int, default=1_000)
 parser.add_argument("--warmup_exponent", type=float, default=1.0)
-parser.add_argument("--stable_steps", type=int, default=0)
+parser.add_argument("--stable_steps", type=int, default=8_000)
 parser.add_argument(
-    "--decay_schedule_name", type=str, default="cosine"
+    "--decay_schedule_name", type=str, default="polynomial"
 )  # 'cosine' or 'polynomial'
 parser.add_argument("--decay_exponent", type=float, default=1.0)
-parser.add_argument("--gradient_accumulation_steps", type=int, default=40)
-parser.add_argument("--batch_size", type=int, default=16)
+parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+parser.add_argument("--batch_size", type=int, default=64)
 parser.add_argument("--grad_clip", type=float, default=0.0)
 ### evaluation
 parser.add_argument("--results_dir", type=str, default="gpt_results")
@@ -580,6 +663,13 @@ parser.add_argument("--ckpt_dir", type=str, default="./checkpoints")
 parser.add_argument(
     "--ckpt_interval", type=int, default=500
 )  # save a checkpoint every 500 steps
+# wandb logging
+parser.add_argument(
+    "--use_wandb", type=lambda x: x.lower() == "true", default=False
+)
+parser.add_argument("--wandb_project", type=str, default="scalable-curvature")
+parser.add_argument("--wandb_entity", type=str, default=None)
+parser.add_argument("--wandb_run_name", type=str, default=None)
 
 
 cfg = parser.parse_args()

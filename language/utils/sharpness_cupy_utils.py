@@ -22,11 +22,32 @@ from utils.optimizers import AdamW
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 @torch.compile
+def _hvp_microbatch(model: nn.Module, loss_fn: nn.Module, x_m: Tensor, y_m: Tensor,
+                    params_dict: Dict[str, Tensor], vec_dict: Dict[str, Tensor]):
+    """ HVP for a single (x_m, y_m) slice. Compiled once and reused across micro-batches
+    because all inputs have constant shape. Detaches before returning so no transform-graph
+    references escape. """
+    def compute_loss(params: Dict[str, Tensor]):
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits = functional_call(model, params, (x_m,))
+            return loss_fn(logits, y_m)
+
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        grad_fn = grad(compute_loss)
+        _, hvp = jvp(grad_fn, (params_dict,), (vec_dict,))
+        return parameters_to_vector(hvp.values()).detach()
+
+
 def compute_hvp(model: nn.Module, loss_fn: nn.Module, batch: Tuple, vec: Tensor, P: Tensor = None, num_microbatches: int = 1):
     """ Hessian-vector product, optionally accumulated over `num_microbatches` slices of the batch
     to bound peak memory. The Hessian of (1/M) sum_m loss_m equals (1/M) sum_m H_m, so we sum the
     per-micro-batch HVPs and divide by M. With num_microbatches=1 this is identical to the
-    original single-batch implementation. """
+    original single-batch implementation (modulo the in-place accumulator).
+
+    Implementation notes: the per-microbatch forward+jvp lives in `_hvp_microbatch` so
+    torch.compile sees a fixed-shape function and compiles it once. Accumulation is in-place
+    into a pre-allocated float32 buffer, and the per-iter `partial` is `del`d so the
+    per-iter JVP intermediates are freed before the next iteration starts. """
 
     x, y = batch
     assert x.shape[0] % num_microbatches == 0, (
@@ -42,26 +63,18 @@ def compute_hvp(model: nn.Module, loss_fn: nn.Module, batch: Tuple, vec: Tensor,
     vec_dict = {name: torch.empty_like(param) for name, param in params_dict.items()}
     vector_to_parameters(vec, vec_dict.values())  # convert the vector to parameters
 
-    flat_hvp = None
-    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-        for m in range(num_microbatches):
-            x_m = x[m * micro_size:(m + 1) * micro_size]
-            y_m = y[m * micro_size:(m + 1) * micro_size]
+    flat_hvp = torch.zeros(vec.numel(), device=vec.device, dtype=torch.float32)
+    for m in range(num_microbatches):
+        x_m = x[m * micro_size:(m + 1) * micro_size]
+        y_m = y[m * micro_size:(m + 1) * micro_size]
+        partial = _hvp_microbatch(model, loss_fn, x_m, y_m, params_dict, vec_dict)
+        flat_hvp.add_(partial)
+        del partial
 
-            def compute_loss(params: Dict[str, Tensor]):
-                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits = functional_call(model, params, (x_m,))
-                    return loss_fn(logits, y_m)
-
-            grad_fn = grad(compute_loss)
-            _, hvp = jvp(grad_fn, (params_dict,), (vec_dict,))
-            partial = parameters_to_vector(hvp.values())
-            flat_hvp = partial if flat_hvp is None else flat_hvp + partial
-
-        flat_hvp = flat_hvp / num_microbatches
-        if P is not None:
-            flat_hvp = flat_hvp / P.sqrt()
-        return flat_hvp.detach()
+    flat_hvp.div_(num_microbatches)
+    if P is not None:
+        flat_hvp.div_(P.sqrt())
+    return flat_hvp
 
 def create_hvp_operator(model: nn.Module, loss_fn: nn.Module, batch: Tuple, P = None, num_microbatches: int = 1):
     """

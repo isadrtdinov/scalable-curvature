@@ -108,12 +108,13 @@ def discover_checkpoints(ckpt_dir):
     return out
 
 
-def load_ckpt_into(model, optim, ckpt_path, device):
+def load_ckpt_into(raw_model, optim, ckpt_path, device):
     """Load weights + optimizer state from ckpt_path into existing model/optim, then ensure
-    the optimizer state tensors live on `device`. Returns the saved config (Namespace)."""
+    the optimizer state tensors live on `device`. `raw_model` must be the uncompiled module
+    so `_orig_mod.` prefix handling is straightforward. Returns the saved config (Namespace)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state_dict = strip_compile_prefix(ckpt["model"])
-    model.load_state_dict(state_dict)
+    raw_model.load_state_dict(state_dict)
     optim.load_state_dict(ckpt["optim"])
     for state in optim.state.values():
         for key, value in state.items():
@@ -126,6 +127,7 @@ def load_ckpt_into(model, optim, ckpt_path, device):
 
 def evaluate_one_ckpt(
     model,
+    raw_model,
     optim,
     cfg,
     saved_cfg,
@@ -137,7 +139,11 @@ def evaluate_one_ckpt(
     lr_guess,
 ):
     """Compute critical-LR + pre-sharpness + sharpness for the current model state. Returns
-    a row dict plus updated warm-start state (eigvec, pre_eigvec, lr_guess)."""
+    a row dict plus updated warm-start state (eigvec, pre_eigvec, lr_guess).
+
+    Critical-LR uses the compiled `model` (forward only); sharpness uses `raw_model` because
+    `torch.func.{grad,jvp,functional_call}` inside compute_hvp does not compose with the
+    OptimizedModule wrapper. This mirrors train_gpt_adam_forward_ckpts.py."""
     data_dir = os.path.join(cfg.data_root, cfg.dataset_name)
     context_len = saved_cfg.context_len
     X, Y = get_batch(data_dir, "train", context_len, cfg.batch_size, device)
@@ -158,7 +164,7 @@ def evaluate_one_ckpt(
 
     pre_sharpness, pre_eigvec_next, num_iters_pre_sharpness = (
         sharpness_utils.get_pre_sharpness_lobpcg(
-            model,
+            raw_model,
             loss_fn,
             optim,
             (X, Y),
@@ -171,7 +177,7 @@ def evaluate_one_ckpt(
     optim.zero_grad(set_to_none=True)
 
     sharpness, eigvec_next, num_iters_sharpness = sharpness_utils.get_sharpness_lobpcg(
-        model,
+        raw_model,
         loss_fn,
         (X, Y),
         eigvecs=eigvec,
@@ -225,12 +231,14 @@ def main(cfg, device):
     template_cfg = first_meta["config"]
     del first_meta
 
-    model, optim, _ = build_model_and_optim(template_cfg, device)
-    num_params_full, embd_params = model.get_num_params()
-    model.to(device)
+    raw_model, optim, _ = build_model_and_optim(template_cfg, device)
+    num_params_full, embd_params = raw_model.get_num_params()
+    raw_model.to(device)
     if cfg.compile:
         print("compiling the model... (takes a ~minute)")
-        model = torch.compile(model)
+        model = torch.compile(raw_model)
+    else:
+        model = raw_model
 
     results = DataStorage(
         columns=[
@@ -255,9 +263,10 @@ def main(cfg, device):
 
     for saved_step, path in ckpts:
         print(f"--- Evaluating step {saved_step} ({os.path.basename(path)}) ---")
-        saved_cfg = load_ckpt_into(model, optim, path, device)
+        saved_cfg = load_ckpt_into(raw_model, optim, path, device)
         row, eigvec, pre_eigvec, lr_guess = evaluate_one_ckpt(
             model=model,
+            raw_model=raw_model,
             optim=optim,
             cfg=cfg,
             saved_cfg=saved_cfg,

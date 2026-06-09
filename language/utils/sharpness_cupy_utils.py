@@ -22,56 +22,69 @@ from utils.optimizers import AdamW
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 @torch.compile
-def compute_hvp(model: nn.Module, loss_fn: nn.Module, batch: Tuple, vec: Tensor, P: Tensor = None):
+def compute_hvp(model: nn.Module, loss_fn: nn.Module, batch: Tuple, vec: Tensor, P: Tensor = None, num_microbatches: int = 1):
+    """ Hessian-vector product, optionally accumulated over `num_microbatches` slices of the batch
+    to bound peak memory. The Hessian of (1/M) sum_m loss_m equals (1/M) sum_m H_m, so we sum the
+    per-micro-batch HVPs and divide by M. With num_microbatches=1 this is identical to the
+    original single-batch implementation. """
 
-    # extract the examples    
     x, y = batch
-    params_dict = dict(model.named_parameters()) 
+    assert x.shape[0] % num_microbatches == 0, (
+        f"batch size {x.shape[0]} must be divisible by num_microbatches {num_microbatches}"
+    )
+    micro_size = x.shape[0] // num_microbatches
+
+    params_dict = dict(model.named_parameters())
 
     if P is not None:
         vec = vec / P.sqrt()
-    
-    vec_dict = {name:torch.empty_like(param) for name, param in params_dict.items()}
-    vector_to_parameters(vec, vec_dict.values()) # convert the vector to parameters
-    
-    def compute_loss(params: Dict[str, Tensor]):
-        """ Computes the loss for the given batch """
-        with torch.amp.autocast(device_type = 'cuda', dtype = torch.bfloat16):
-            logits = functional_call(model, params, (x,)) 
-            loss = loss_fn(logits, y)
-            return loss
-    
-    # hvp computation
-    with torch.amp.autocast(device_type = 'cuda', dtype = torch.bfloat16):
-        grad_fn = grad(compute_loss)
-        _, hvp = jvp(grad_fn, (params_dict,), (vec_dict,)) # jvp computes the Jacobian-vector product
-        flat_hvp = parameters_to_vector(hvp.values()) # flatten the hvp
+
+    vec_dict = {name: torch.empty_like(param) for name, param in params_dict.items()}
+    vector_to_parameters(vec, vec_dict.values())  # convert the vector to parameters
+
+    flat_hvp = None
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        for m in range(num_microbatches):
+            x_m = x[m * micro_size:(m + 1) * micro_size]
+            y_m = y[m * micro_size:(m + 1) * micro_size]
+
+            def compute_loss(params: Dict[str, Tensor]):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    logits = functional_call(model, params, (x_m,))
+                    return loss_fn(logits, y_m)
+
+            grad_fn = grad(compute_loss)
+            _, hvp = jvp(grad_fn, (params_dict,), (vec_dict,))
+            partial = parameters_to_vector(hvp.values())
+            flat_hvp = partial if flat_hvp is None else flat_hvp + partial
+
+        flat_hvp = flat_hvp / num_microbatches
         if P is not None:
             flat_hvp = flat_hvp / P.sqrt()
         return flat_hvp.detach()
 
-def create_hvp_operator(model: nn.Module, loss_fn: nn.Module, batch: Tuple, P = None):
+def create_hvp_operator(model: nn.Module, loss_fn: nn.Module, batch: Tuple, P = None, num_microbatches: int = 1):
     """
     Create HVP operator - both function and LinearOperator
     """
     num_params = len(parameters_to_vector(model.parameters()))
-    
+
     def hessian_matvec(v_cupy):
         """ Matrix-vector product for LOBPCG """
         # Convert CuPy to PyTorch
         v_torch = torch.as_tensor(v_cupy, device = 'cuda', dtype = torch.float32).flatten()
-        
+
         # Compute HVP using your existing function
-        hvp_torch = compute_hvp(model, loss_fn, batch, v_torch, P)
+        hvp_torch = compute_hvp(model, loss_fn, batch, v_torch, P, num_microbatches=num_microbatches)
 
         hvp_cupy = cp.asarray(hvp_torch.detach())
-        
+
         # Convert back to CuPy
         return hvp_cupy.reshape(-1, 1)
-    
-    # Create LinearOperator 
+
+    # Create LinearOperator
     linear_op = LinearOperator(shape = (num_params, num_params), matvec = hessian_matvec, dtype = cp.float32)
-    
+
     return linear_op, num_params
 
 
@@ -114,11 +127,11 @@ def lobpcg_solver(hvp_op: LinearOperator, num_params: int, eigvecs: cp.array, to
     return best_sharpness, eigvecs, best_residual, num_iters
 
 
-def get_sharpness_lobpcg(model: nn.Module, loss_fn: nn.Module, batch: Tuple, eigvecs: cp.array = None, tol: float = 1e-11, max_iters: int = 1000):
+def get_sharpness_lobpcg(model: nn.Module, loss_fn: nn.Module, batch: Tuple, eigvecs: cp.array = None, tol: float = 1e-11, max_iters: int = 1000, num_microbatches: int = 1):
     """ Compute sharpness (top eigenvalue) using LOBPCG with LinearOperator """
-    
+
     # Create the HVP LinearOperator
-    hvp_op, num_params = create_hvp_operator(model, loss_fn, batch)
+    hvp_op, num_params = create_hvp_operator(model, loss_fn, batch, num_microbatches=num_microbatches)
 
     # Run LOBPCG with LinearOperator
     sharpness, eigvecs, residual, num_iters = lobpcg_solver(hvp_op, num_params, eigvecs, tol, max_iters)
@@ -162,32 +175,39 @@ def get_adam_preconditioner(params: dict, loss: nn.Module, optim: torch.optim.Op
     return P
 
 
-def get_pre_sharpness_lobpcg(model: nn.Module, loss_fn: nn.Module, optim: torch.optim.Optimizer, batch: Tuple, eigvecs: cp.array = None, tol: float = 1e-9, max_iters: int = 1000):
-    """ Compute sharpness (top eigenvalue) using LOBPCG with LinearOperator """
-    
+def get_pre_sharpness_lobpcg(model: nn.Module, loss_fn: nn.Module, optim: torch.optim.Optimizer, batch: Tuple, eigvecs: cp.array = None, tol: float = 1e-9, max_iters: int = 1000, num_microbatches: int = 1):
+    """ Compute sharpness (top eigenvalue) using LOBPCG with LinearOperator.
+
+    The Adam preconditioner reads param.grad of the full-batch loss; we reproduce that gradient
+    via micro-batched accumulation (each micro-batch contributes loss_m / num_microbatches). """
+
     x, y = batch
+    assert x.shape[0] % num_microbatches == 0, (
+        f"batch size {x.shape[0]} must be divisible by num_microbatches {num_microbatches}"
+    )
+    micro_size = x.shape[0] // num_microbatches
 
     @torch.compile
-    def compute_loss():
-        with torch.amp.autocast(device_type = 'cuda', dtype = torch.bfloat16):
-            logits = model(x)
-            loss = loss_fn(logits, y)
+    def compute_loss_micro(x_m, y_m):
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits = model(x_m)
+            loss = loss_fn(logits, y_m)
         return loss
 
-    # Compute loss and gradients because Adam pre-conditioner requires gradients; Note grads can be utilized from critical LR computations
-    # set gradients to None
-    optim.zero_grad(set_to_none = True)
-    
-    loss = compute_loss()
-    loss_params = loss.item()
-    loss.backward()
+    # Compute the full-batch gradient by accumulating micro-batch gradients in-place on .grad.
+    optim.zero_grad(set_to_none=True)
+    for m in range(num_microbatches):
+        x_m = x[m * micro_size:(m + 1) * micro_size]
+        y_m = y[m * micro_size:(m + 1) * micro_size]
+        loss_m = compute_loss_micro(x_m, y_m) / num_microbatches
+        loss_m.backward()
 
     P = get_adam_preconditioner(model.named_parameters(), loss_fn, optim)
 
     optim.zero_grad(set_to_none = True) # free up the memory for sharpness computation
     # Create the HVP LinearOperator
-    hvp_op, num_params = create_hvp_operator(model, loss_fn, batch, P)
-    
+    hvp_op, num_params = create_hvp_operator(model, loss_fn, batch, P, num_microbatches=num_microbatches)
+
     # Run LOBPCG with LinearOperator
     sharpness, eigvecs, residual, num_iters = lobpcg_solver(hvp_op, num_params, eigvecs, tol, max_iters)
 

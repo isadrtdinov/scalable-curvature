@@ -93,17 +93,18 @@ def adam_fn(params: Dict[str, Tensor], optim: torch.optim.Optimizer, lr: float) 
 
 def compute_critical_learning_rate(
         ctx: Any,
-        model: nn.Module, 
-        loss_fn: nn.Module, 
+        model: nn.Module,
+        loss_fn: nn.Module,
         optim: torch.optim.Optimizer,
         batch: Tuple[torch.Tensor, torch.Tensor],
         lr_guess: float,
         tol_power: int = 4,
         recompute_grads: bool = True,
-        verbose: bool = False
+        verbose: bool = False,
+        num_microbatches: int = 1,
     ):
     """
-    Computes the critical learning rate using 
+    Computes the critical learning rate using
 
     Inputs:
         - model: torch model
@@ -111,6 +112,8 @@ def compute_critical_learning_rate(
         - batch: (x, y)
         - lr_guess: initial guess for the learning rate
         - delta: small constant for termination condition: L(theta_t+1) > L(theta_t)
+        - num_microbatches: split the batch into this many slices for the forward/backward passes
+          to bound peak memory. With num_microbatches=1 this is identical to the original behavior.
     Returns:
         - lr_star: critical learning rate
 
@@ -118,7 +121,7 @@ def compute_critical_learning_rate(
     """
 
     assert lr_guess > 0, f'Expected a non-zero positive number, got {lr_guess}'
-    
+
     # setup optimizer function. NOTE: weight decay is not supported well.
     if isinstance(optim, torch.optim.SGD):
         optim_fn = sgd_fn
@@ -130,39 +133,60 @@ def compute_critical_learning_rate(
     total_iters = 0
     # extract the examples
     x, y = batch
+    assert x.shape[0] % num_microbatches == 0, (
+        f"batch size {x.shape[0]} must be divisible by num_microbatches {num_microbatches}"
+    )
+    micro_size = x.shape[0] // num_microbatches
 
     @torch.compile
-    def compute_loss():
+    def compute_loss_micro(x_m, y_m):
         with ctx:
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            logits = model(x_m)
+            loss = loss_fn(logits, y_m)
+        return loss
+
+    @torch.compile
+    def compute_loss_micro_func(params_next, x_m, y_m):
+        with ctx:
+            logits = torch.func.functional_call(model, params_next, (x_m,))
+            loss = loss_fn(logits, y_m)
         return loss
 
     # NOTE: I am not counting the forward and backward pass into the calculation because a smart implmentation can perform a optimizer step right here
-    # Compute loss and gradients    
+    # Compute loss and gradients
     if recompute_grads or check_if_grads_None(model):
         if verbose:
             print('Recomputing grads .....')
         # set gradients to None
         optim.zero_grad(set_to_none = True)
-    
-        loss = compute_loss()
-        loss_params = loss.item()
-        loss.backward()
+
+        loss_params = 0.0
+        for m in range(num_microbatches):
+            x_m = x[m * micro_size:(m + 1) * micro_size]
+            y_m = y[m * micro_size:(m + 1) * micro_size]
+            loss_m = compute_loss_micro(x_m, y_m)
+            scaled = loss_m / num_microbatches
+            loss_params += scaled.item()
+            scaled.backward()
     else:
         with torch.no_grad():
-            loss_params = compute_loss().item()
-    
-    @torch.compile
+            loss_params = 0.0
+            for m in range(num_microbatches):
+                x_m = x[m * micro_size:(m + 1) * micro_size]
+                y_m = y[m * micro_size:(m + 1) * micro_size]
+                loss_params += compute_loss_micro(x_m, y_m).item() / num_microbatches
+
     def update_and_compute_loss(lr: float):
         with torch.no_grad():
             # Compute new parameters without modifying the original ones
             params_next = optim_fn(params = model.named_parameters(), optim = optim, lr = lr)
-            # Compute new loss with updated parameters
-            with ctx:
-                logits = torch.func.functional_call(model, params_next, (x,))
-                loss = loss_fn(logits, y)
-                return loss
+            # Compute new loss with updated parameters, accumulated over micro-batches
+            loss_total = 0.0
+            for m in range(num_microbatches):
+                x_m = x[m * micro_size:(m + 1) * micro_size]
+                y_m = y[m * micro_size:(m + 1) * micro_size]
+                loss_total += compute_loss_micro_func(params_next, x_m, y_m).item() / num_microbatches
+            return loss_total
     
     def exponential_search(loss_before: float, lr_guess: float, max_iters: int = 100,):
         

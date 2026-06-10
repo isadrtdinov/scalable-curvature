@@ -17,12 +17,12 @@ source venv/bin/activate
 # RANK / LOCAL_RANK / WORLD_SIZE from torchrun's env. gradient_accumulation_steps
 # is divided by world_size internally, so keep it divisible by 2.
 torchrun --standalone --nproc_per_node=2 language/train_gpt_adam_forward_ckpts.py \
-    --dataset_name openwebtext \
+    --dataset_name fineweb \
     --num_layers 12 \
     --num_heads 12 \
     --init_var 1.0 \
     --batch_size 16 \
-    --gradient_accumulation_steps 32 \
+    --gradient_accumulation_steps 64 \
     --lr_peak 1e-05 \
     --lr_min_factor inf \
     --grad_clip 0.0 \
@@ -36,4 +36,4 @@ torchrun --standalone --nproc_per_node=2 language/train_gpt_adam_forward_ckpts.p
     --ckpt_interval 500 \
     --use_wandb true \
     --wandb_project scalable-curvature \
-    --wandb_run_name gpt2-curvature
+    --wandb_run_name gpt2-fineweb

@@ -220,7 +220,7 @@ parser = argparse.ArgumentParser(description = 'Image classification using FCNs'
 parser.add_argument('--random_seed', type = int, default = 42)
 # dataset
 parser.add_argument('--dataset_name', type = str, default = 'cifar-10', choices = data_utils.DATASETS.keys())
-parser.add_argument('--data_dir', type = str, default = '~/datasets/')
+parser.add_argument('--data_dir', type = str, default = './data')
 parser.add_argument('--in_dim', type = int, default = 32*32*3)
 parser.add_argument('--num_classes', type = int, default = 10)
 

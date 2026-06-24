@@ -41,4 +41,7 @@ python image/train_fcn_image_adamw_dir_sharp.py \
     --max_iters 200 \
     --sharpness_tol 1e-11 \
     --subset_size 10000 \
-    --results_dir adam_dir_sharp_results
+    --results_dir adam_dir_sharp_results \
+    --use_wandb true \
+    --wandb_project scalable-curvature \
+    --wandb_run_name fcn-cifar-adamw

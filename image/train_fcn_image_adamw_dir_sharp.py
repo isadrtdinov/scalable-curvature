@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import hashlib
 import argparse
 import numpy as np
 import pandas as pd
@@ -17,11 +18,18 @@ from torch.utils.data import Dataset, DataLoader
 import utils.models as model_utils
 import utils.image_data as data_utils
 from utils.schedules_utils import warmup_stable_decay
-import utils.sharpness_cupy_utils as sharpness_cupy_utils 
+import utils.sharpness_cupy_utils as sharpness_cupy_utils
 import utils.sharpness_dir_utils as sharpness_dir_utils
 import utils.loss_functions as loss_functions
 from utils.critical_learning_rate import compute_critical_learning_rate
 torch.set_float32_matmul_precision('high')
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -78,6 +86,10 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
     eigvec = None
     pre_eigvec = None
 
+    use_wandb = cfg.use_wandb and WANDB_AVAILABLE
+    if cfg.use_wandb and not WANDB_AVAILABLE:
+        print('wandb requested but not installed; skipping wandb logging.')
+
     print(f'Training for {cfg.num_epochs} epochs')
 
     for epoch in range(cfg.num_epochs):
@@ -85,7 +97,9 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
         for batch_idx, batch in enumerate(iterate_dataset(train_dataset, cfg.batch_size)):
 
             step = epoch * cfg.num_steps_per_epoch + batch_idx
-            
+
+            wandb_metrics = {} if use_wandb else None
+
             if step % cfg.eval_interval == 0:
 
                 # Evaluation
@@ -95,13 +109,19 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
                 result = np.array([step, train_loss, train_acc, test_loss, test_acc])
                 eval_results.append(result)
 
+                if use_wandb:
+                    wandb_metrics['train_loss'] = train_loss
+                    wandb_metrics['train_acc'] = train_acc
+                    wandb_metrics['test_loss'] = test_loss
+                    wandb_metrics['test_acc'] = test_acc
+
                 ### Critical LR and sharpness computation ###
 
                 (lr_lower, lr_upper), num_iters_critical = compute_critical_learning_rate(model = model, loss_fn = loss_fn, optim = optim, batch = batch, lr_guess = lr_guess, tol_power = cfg.crit_lr_tol_power, recompute_grads = cfg.recompute_grads)
                 lr_guess = lr_lower
 
                 print(f'LR Range: {lr_lower:0.2e}, {lr_upper:0.2e} computed in {num_iters_critical} steps')
-                
+
                 # flush the gradients before sharpness computation to save memory
                 optim.zero_grad(set_to_none = True)
 
@@ -118,7 +138,18 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
 
                 result = np.asarray([step, pre_sharpness_step, pre_num_iters, sharpness_step, num_iters, dir_sharpness_step, lr_lower, lr_upper, num_iters_critical])
                 forward_results.append(result)
-                
+
+                if use_wandb:
+                    wandb_metrics['lr_lower'] = lr_lower
+                    wandb_metrics['lr_upper'] = lr_upper
+                    wandb_metrics['num_iters_critical'] = num_iters_critical
+                    wandb_metrics['pre_sharpness'] = pre_sharpness_step
+                    wandb_metrics['pre_num_iters'] = pre_num_iters
+                    wandb_metrics['sharpness'] = sharpness_step
+                    wandb_metrics['num_iters_sharpness'] = num_iters
+                    wandb_metrics['critical_lr_sharpness'] = cfg.critical_threshold / pre_sharpness_step
+                    wandb_metrics['dir_sharpness'] = dir_sharpness_step
+
                 # flush the gradients; I dont think I need it here but just to be safe
                 optim.zero_grad(set_to_none = True)
 
@@ -157,6 +188,11 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
             result = np.asarray([step, lr_step, loss_step])
             train_results.append(result)
 
+            if use_wandb:
+                wandb_metrics['lr_step'] = lr_step
+                wandb_metrics['loss_step'] = loss_step
+                wandb.log(wandb_metrics, step=step)
+
             if step % 100 == 0:
                 df_train = pd.DataFrame(np.asarray(train_results), columns = ['step', 'lr_step', 'loss_step'])
                 df_train.to_csv(train_path)
@@ -169,7 +205,12 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
 
             if np.isnan(loss_step) or np.isinf(loss_step):
                 print(f'Loss is NaN or Inf at step {step}. Stopping training.')
+                if use_wandb:
+                    wandb.finish()
                 return np.asarray(train_results), np.asarray(eval_results), np.asarray(forward_results)
+
+    if use_wandb:
+        wandb.finish()
 
     return train_results, eval_results, forward_results
 
@@ -220,6 +261,11 @@ parser.add_argument('--results_dir', type = str, default = 'adam_dir_sharp_resul
 parser.add_argument('--save_model', type = bool, default = False)
 parser.add_argument('--eval_interval', type = int, default = 1)
 parser.add_argument('--subset_size', type = int, default = 10_000) # for computing the training loss during evaluation
+# wandb logging
+parser.add_argument('--use_wandb', type = lambda x: x.lower() == 'true', default = False)
+parser.add_argument('--wandb_project', type = str, default = 'scalable-curvature')
+parser.add_argument('--wandb_entity', type = str, default = None)
+parser.add_argument('--wandb_run_name', type = str, default = None)
 
 cfg = parser.parse_args()
 
@@ -264,6 +310,20 @@ exp_id = f'{cfg.dataset_name}_{cfg.loss_name}_I{cfg.random_seed}_{cfg.model_name
 train_path = os.path.join(cfg.results_dir, f'train_{exp_id}.csv')
 forward_path = os.path.join(cfg.results_dir, f'forward_{exp_id}.csv')
 eval_path = os.path.join(cfg.results_dir, f'eval_{exp_id}.csv')
+
+# wandb init
+if cfg.use_wandb and WANDB_AVAILABLE:
+    run_id = hashlib.md5(exp_id.encode()).hexdigest()
+    wandb.init(
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity,
+        name=cfg.wandb_run_name or exp_id[:128],
+        id=run_id,
+        resume='allow',
+        config=vars(cfg),
+    )
+elif cfg.use_wandb and not WANDB_AVAILABLE:
+    print('wandb requested but not installed; skipping wandb logging.')
 
 # Training go Brrr.....
 train_results, eval_results, forward_results = train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_test, x_subset, y_subset)

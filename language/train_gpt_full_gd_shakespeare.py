@@ -280,7 +280,9 @@ def train_and_evaluate(cfg, device):
             recompute_grads=cfg.recompute_grads,
             num_microbatches=cfg.gradient_accumulation_steps,
         )
-        lr_guess = lr_lower
+        # guard against degenerate (underflowed / non-converged) search results
+        # — compute_critical_learning_rate requires lr_guess > 0 next step
+        lr_guess = lr_lower if lr_lower > 0 else cfg.lr_peak
 
         forward_results.add_entry(
             step=step,

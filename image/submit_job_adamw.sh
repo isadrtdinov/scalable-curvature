@@ -26,9 +26,9 @@ python image/train_fcn_image_adamw_dir_sharp.py \
     --batch_size 50000 \
     --lr_peak 0.03 \
     --lr_min_factor inf \
-    --warmup_steps 100 \
-    --stable_steps 0 \
-    --decay_schedule_name cosine \
+    --warmup_steps 1000 \
+    --stable_steps 8000 \
+    --decay_schedule_name polynomial \
     --decay_exponent 1.0 \
     --beta1 0.9 \
     --beta2 0.99 \

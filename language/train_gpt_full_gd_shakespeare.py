@@ -269,40 +269,40 @@ def train_and_evaluate(cfg, device):
 
         wandb_metrics = {} if use_wandb else None
 
-        (lr_lower, lr_upper), num_iters_critical = compute_critical_learning_rate(
-            ctx=ctx,
-            model=model,
-            loss_fn=loss_fn,
-            optim=optim,
-            batch=(X_all, Y_all),
-            lr_guess=lr_guess,
-            tol_power=cfg.crit_lr_tol_power,
-            recompute_grads=cfg.recompute_grads,
-            num_microbatches=cfg.gradient_accumulation_steps,
-        )
-        # guard against degenerate (underflowed / non-converged) search results
-        # — compute_critical_learning_rate requires lr_guess > 0 next step
-        lr_guess = lr_lower if lr_lower > 0 else cfg.lr_peak
-
-        forward_results.add_entry(
-            step=step,
-            lr_step=lr_step,
-            lr_lower=lr_lower,
-            lr_upper=lr_upper,
-            num_iters_critical=num_iters_critical,
-        )
-        print(
-            f"LR Range: {lr_lower:0.1e}, {lr_upper:0.1e} computed in "
-            f"{num_iters_critical} steps"
-        )
-        if use_wandb:
-            wandb_metrics["lr_lower"] = lr_lower
-            wandb_metrics["lr_upper"] = lr_upper
-            wandb_metrics["num_iters_critical"] = num_iters_critical
-
-        optim.zero_grad(set_to_none=True)
-
         if step % cfg.sharpness_interval == 0:
+            (lr_lower, lr_upper), num_iters_critical = compute_critical_learning_rate(
+                ctx=ctx,
+                model=model,
+                loss_fn=loss_fn,
+                optim=optim,
+                batch=(X_all, Y_all),
+                lr_guess=lr_guess,
+                tol_power=cfg.crit_lr_tol_power,
+                recompute_grads=cfg.recompute_grads,
+                num_microbatches=cfg.gradient_accumulation_steps,
+            )
+            # guard against degenerate (underflowed / non-converged) search results
+            # — compute_critical_learning_rate requires lr_guess > 0 next call
+            lr_guess = lr_lower if lr_lower > 0 else cfg.lr_peak
+
+            forward_results.add_entry(
+                step=step,
+                lr_step=lr_step,
+                lr_lower=lr_lower,
+                lr_upper=lr_upper,
+                num_iters_critical=num_iters_critical,
+            )
+            print(
+                f"LR Range: {lr_lower:0.1e}, {lr_upper:0.1e} computed in "
+                f"{num_iters_critical} steps"
+            )
+            if use_wandb:
+                wandb_metrics["lr_lower"] = lr_lower
+                wandb_metrics["lr_upper"] = lr_upper
+                wandb_metrics["num_iters_critical"] = num_iters_critical
+
+            optim.zero_grad(set_to_none=True)
+
             pre_sharpness_step, pre_eigvec, num_iters_pre_sharpness = (
                 sharpness_utils.get_pre_sharpness_lobpcg(
                     model,

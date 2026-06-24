@@ -19,7 +19,6 @@ import utils.models as model_utils
 import utils.image_data as data_utils
 from utils.schedules_utils import warmup_stable_decay
 import utils.sharpness_cupy_utils as sharpness_cupy_utils
-import utils.sharpness_dir_utils as sharpness_dir_utils
 import utils.loss_functions as loss_functions
 from utils.critical_learning_rate import compute_critical_learning_rate
 torch.set_float32_matmul_precision('high')
@@ -132,11 +131,7 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
                 sharpness_step, eigvec, num_iters = sharpness_cupy_utils.get_sharpness_lobpcg(model = model, loss_fn = loss_fn, batch = batch, max_iters = cfg.max_iters, tol = cfg.sharpness_tol, eigvecs = eigvec)
                 print(f'Sharpness: {sharpness_step:0.4f} computed in {num_iters} steps')
 
-                # compute directional sharpness
-                dir_sharpness_step = sharpness_dir_utils.get_dir_sharpness(model = model, loss_fn = loss_fn, optim = optim, batch = batch)
-                print(f'Directional Sharpness: {dir_sharpness_step:0.2e}, critical LR: {2/dir_sharpness_step:0.2e}')
-
-                result = np.asarray([step, pre_sharpness_step, pre_num_iters, sharpness_step, num_iters, dir_sharpness_step, lr_lower, lr_upper, num_iters_critical])
+                result = np.asarray([step, pre_sharpness_step, pre_num_iters, sharpness_step, num_iters, lr_lower, lr_upper, num_iters_critical])
                 forward_results.append(result)
 
                 if use_wandb:
@@ -148,7 +143,6 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
                     wandb_metrics['sharpness'] = sharpness_step
                     wandb_metrics['num_iters_sharpness'] = num_iters
                     wandb_metrics['critical_lr_sharpness'] = cfg.critical_threshold / pre_sharpness_step
-                    wandb_metrics['dir_sharpness'] = dir_sharpness_step
 
                 # flush the gradients; I dont think I need it here but just to be safe
                 optim.zero_grad(set_to_none = True)
@@ -200,7 +194,7 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
                 df_eval = pd.DataFrame(np.asarray(eval_results), columns = ['step', 'train_loss', 'train_acc', 'test_loss', 'test_acc'])
                 df_eval.to_csv(eval_path)
 
-                df_forward = pd.DataFrame(np.asarray(forward_results), columns = ['step', 'pre_sharpness_step', 'pre_num_iters', 'sharpness', 'num_iters', 'dir_sharpness_step', 'lr_lower', 'lr_upper', 'num_iters_critical'])
+                df_forward = pd.DataFrame(np.asarray(forward_results), columns = ['step', 'pre_sharpness_step', 'pre_num_iters', 'sharpness', 'num_iters', 'lr_lower', 'lr_upper', 'num_iters_critical'])
                 df_forward.to_csv(forward_path)
 
             if np.isnan(loss_step) or np.isinf(loss_step):
@@ -334,5 +328,5 @@ df_train.to_csv(train_path)
 df_eval = pd.DataFrame(np.asarray(eval_results), columns = ['step', 'train_loss', 'train_acc', 'test_loss', 'test_acc'])
 df_eval.to_csv(eval_path)
 
-df_forward = pd.DataFrame(np.asarray(forward_results), columns = ['step', 'pre_sharpness_step', 'pre_num_iters', 'sharpness', 'num_iters', 'dir_sharpness_step', 'lr_lower', 'lr_upper', 'num_iters_critical'])
+df_forward = pd.DataFrame(np.asarray(forward_results), columns = ['step', 'pre_sharpness_step', 'pre_num_iters', 'sharpness', 'num_iters', 'lr_lower', 'lr_upper', 'num_iters_critical'])
 df_forward.to_csv(forward_path)

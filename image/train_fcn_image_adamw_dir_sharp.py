@@ -126,7 +126,12 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
 
                 # eigenvalue estimation using power method
                 pre_sharpness_step, pre_eigvec, pre_num_iters = sharpness_cupy_utils.get_pre_sharpness_lobpcg(model = model, loss_fn = loss_fn, optim = optim, batch = batch, max_iters = cfg.max_iters, tol = cfg.sharpness_tol, eigvecs = pre_eigvec)
-                print(f'Pre-Sharpness: {pre_sharpness_step:0.2e} computed in {pre_num_iters} steps, critical LR: {cfg.critical_threshold/pre_sharpness_step:0.2e}')
+                # guard against ~0 pre-sharpness (would blow up the critical-LR ratio)
+                pre_sharp_safe = abs(pre_sharpness_step) > 1e-12
+                if pre_sharp_safe:
+                    print(f'Pre-Sharpness: {pre_sharpness_step:0.2e} computed in {pre_num_iters} steps, critical LR: {cfg.critical_threshold/pre_sharpness_step:0.2e}')
+                else:
+                    print(f'Pre-Sharpness: {pre_sharpness_step:0.2e} computed in {pre_num_iters} steps, critical LR: skipped (pre-sharpness too small)')
 
                 sharpness_step, eigvec, num_iters = sharpness_cupy_utils.get_sharpness_lobpcg(model = model, loss_fn = loss_fn, batch = batch, max_iters = cfg.max_iters, tol = cfg.sharpness_tol, eigvecs = eigvec)
                 print(f'Sharpness: {sharpness_step:0.4f} computed in {num_iters} steps')
@@ -142,7 +147,8 @@ def train_and_evaluate(cfg, model, loss_fn, optim, x_train, y_train, x_test, y_t
                     wandb_metrics['pre_num_iters'] = pre_num_iters
                     wandb_metrics['sharpness'] = sharpness_step
                     wandb_metrics['num_iters_sharpness'] = num_iters
-                    wandb_metrics['critical_lr_sharpness'] = cfg.critical_threshold / pre_sharpness_step
+                    if pre_sharp_safe:
+                        wandb_metrics['critical_lr_sharpness'] = cfg.critical_threshold / pre_sharpness_step
 
                 # flush the gradients; I dont think I need it here but just to be safe
                 optim.zero_grad(set_to_none = True)

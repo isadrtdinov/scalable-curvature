@@ -435,7 +435,7 @@ def train_and_evaluate(cfg, device):
                     eigvecs=pre_eigvec,
                     tol=cfg.sharpness_tol,
                     max_iters=cfg.max_iters,
-                    num_microbatches=2
+                    num_microbatches=4
                 )
             )
             mprint(
@@ -450,7 +450,7 @@ def train_and_evaluate(cfg, device):
                     eigvecs=eigvec,
                     tol=cfg.sharpness_tol,
                     max_iters=cfg.max_iters,
-                    num_microbatches=2
+                    num_microbatches=4
                 )
             )
             mprint(

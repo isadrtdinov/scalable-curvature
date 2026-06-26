@@ -59,14 +59,18 @@ torch.backends.cudnn.allow_tf32 = True  # enable tf32 on cudnn
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss(
-    ctx, model, loss_fn, eval_steps, data_dir, context_len, batch_size, device
+    ctx, model, loss_fn, eval_steps, data_dir, context_len, batch_size, device,
+    load_to_ram=True,
 ):
     out = {}
     model.eval()
     for split in ["train", "val"]:
         losses = torch.zeros(eval_steps)
         for k in range(eval_steps):
-            X, Y = get_batch(data_dir, split, context_len, batch_size, device)
+            X, Y = get_batch(
+                data_dir, split, context_len, batch_size, device,
+                load_to_ram=load_to_ram,
+            )
             with ctx:
                 logits = model(X)
                 loss = loss_fn(logits, Y)
@@ -354,7 +358,10 @@ def train_and_evaluate(cfg, device):
     data_dir = os.path.join("data", cfg.dataset_name)
     mprint(f"data_dir: {data_dir}")
 
-    X, Y = get_batch(data_dir, "train", cfg.context_len, cfg.batch_size, device)
+    X, Y = get_batch(
+        data_dir, "train", cfg.context_len, cfg.batch_size, device,
+        load_to_ram=cfg.load_to_ram,
+    )
     # initial eigenvec
     eigvec = None
     pre_eigvec = None
@@ -492,6 +499,7 @@ def train_and_evaluate(cfg, device):
                 cfg.context_len,
                 cfg.batch_size,
                 device,
+                load_to_ram=cfg.load_to_ram,
             )
             eval_results.add_entry(
                 step=step,
@@ -546,7 +554,10 @@ def train_and_evaluate(cfg, device):
                 )  # scale the loss to account for gradient accumulation
 
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch(data_dir, "train", cfg.context_len, cfg.batch_size, device)
+            X, Y = get_batch(
+                data_dir, "train", cfg.context_len, cfg.batch_size, device,
+                load_to_ram=cfg.load_to_ram,
+            )
             # backward pass
             loss.backward()
 
@@ -597,6 +608,9 @@ parser.add_argument(
 ### dataset
 parser.add_argument("--dataset_name", type=str, default="fineweb")
 parser.add_argument("--vocab_size", type=int, default=50304)
+parser.add_argument(
+    "--load_to_ram", type=lambda x: x.lower() == "true", default=True
+)  # if False, read batches via np.memmap instead of caching the full split in RAM
 # GPU + DDP
 
 ### model

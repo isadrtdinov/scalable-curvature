@@ -381,8 +381,8 @@ def train_and_evaluate(cfg, device):
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             name=cfg.wandb_run_name or run_base[:128],
-            id=run_id,
-            resume="allow",
+            # id=run_id,
+            # resume="allow",
             config={**vars(cfg), "num_params": num_params, "embd_params": embd_params},
         )
 
